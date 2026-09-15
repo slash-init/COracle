@@ -12,8 +12,14 @@ out/
 *.so
 
 # Manual test binaries
-test_rng
-test_ast
+test_*
+!test_*.*
+!tests/
+
+# Generated executables
+/generated_exe
+generated_*
+!generated_*.*
 
 # CMake
 CMakeFiles/
