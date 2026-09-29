@@ -12,6 +12,8 @@ out/
 *.so
 
 # Manual test binaries
+test_rng
+test_ast
 test_*
 !test_*.*
 !tests/
