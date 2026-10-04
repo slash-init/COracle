@@ -32,7 +32,7 @@ Compilers such as GCC and Clang are complex software systems performing aggressi
                     └── Yes ──> Report / Reduce
 ```
 
-COracle is currently being built from the ground up as a research project. The current repository contains the foundational program generation and subprocess execution pipeline; the multi-compiler comparison oracle and test-case reduction stages are scheduled for subsequent development phases.
+COracle is being built from the ground up as a research project. The repository currently implements the full single-seed differential testing pipeline: deterministic program generation, GCC and Clang compilation, isolated execution, and behavioral comparison. Multi-seed campaign scheduling, test-case reduction, and bug reporting are scheduled for subsequent development phases.
 
 ## Current Status
 
@@ -45,9 +45,10 @@ The table below reflects the **actual status of components implemented in the re
 | **AST Printer** (`coracle::print_program`) | **Implemented** | Converts an AST into compilable, well-formatted C source text with defensive parenthesization. |
 | **Random Program Generator** (`coracle::generate_program`) | **Implemented** | Generates constrained, scoped random ASTs within depth and variable-tracking bounds. |
 | **Process Runner** (`coracle::run_process`) | **Implemented** | POSIX subprocess executor using `fork`, `execvp`, and pipes with timeout detection and output capping. |
-| **Compiler Toolchain Wrapper** | *Planned* | Abstraction layer to invoke external compilers (`gcc`, `clang`) with varying optimization flags. |
-| **Differential Oracle** | *Planned* | Comparison engine evaluating stdout, stderr, and exit codes across compiler outputs. |
-| **Result Classifier & Triage** | *Planned* | Classifies findings into compiler crashes (ICE), execution divergence, timeouts, or anomalies. |
+| **Compiler Toolchain Wrapper** (`coracle::compile_source`) | **Implemented** | Invokes GCC or Clang via `process_runner`, captures diagnostics, reports success/failure/timeout. |
+| **Differential Oracle** (`coracle::run_differential_test`) | **Implemented** | Compiles source with both GCC and Clang, runs both executables, compares stdout and exit codes. |
+| **Verdict Classification** (`coracle::Verdict`) | **Implemented** | Distinguishes `Match`, `Mismatch`, `GccCompileFailed`, `ClangCompileFailed`, `GccRunTimedOut`, and `ClangRunTimedOut`. |
+| **End-to-End CLI** (`src/main.cpp`) | **Implemented** | `coracle --seed <N>` runs the full pipeline (generate → compile → execute → compare) for a single seed. |
 | **Test-Case Reducer** | *Planned* | Minimizes discrepancy-inducing programs down to small, isolated bug reports. |
 | **Continuous Campaign Scheduler** | *Planned* | High-throughput fuzzing loop automating generation, execution, and artifact archiving. |
 
@@ -55,58 +56,48 @@ The table below reflects the **actual status of components implemented in the re
 
 ### Current Implemented Pipeline
 
-The currently implemented codebase takes an explicit 64-bit random seed and generator configuration, deterministically constructs a valid Abstract Syntax Tree (AST), prints that AST into standard C code, and provides a POSIX subprocess runner to execute external binaries safely.
+The implemented pipeline takes an explicit 64-bit random seed, deterministically constructs a valid Abstract Syntax Tree (AST), prints that AST into standard C code, compiles it with both GCC and Clang, executes both binaries in isolated subprocesses, and compares their observable behavior (stdout and exit codes) to produce a differential verdict:
 
 ```mermaid
 flowchart TD
-    Seed["Seed (uint64_t)"] --> RNG["Deterministic RNG\n(std::mt19937_64)"]
+    Seed["Seed (--seed N)"] --> RNG["Deterministic RNG\n(std::mt19937_64)"]
     Config["GeneratorConfig\n(depth, statement count, int range)"] --> Gen["Program Generator\n(coracle::generate_program)"]
     RNG --> Gen
     Gen --> AST["Abstract Syntax Tree\n(coracle::ast::Program)"]
     AST --> Printer["AST Printer\n(coracle::print_program)"]
-    Printer --> CSource["Generated C Source\n(#include <stdio.h>, main)"]
-    CSource -.->|"Manual compilation\n& execution"| Runner["Process Runner\n(coracle::run_process)"]
-    Runner --> Result["ProcessResult\n(exit code, stdout, stderr, timeout)"]
+    Printer --> CSource["Generated C Source"]
+    CSource --> GCC["Compiler Runner (GCC)\n(coracle::compile_source)"]
+    CSource --> Clang["Compiler Runner (Clang)\n(coracle::compile_source)"]
+    GCC --> RunGCC["Process Runner\n(execute GCC binary)"]
+    Clang --> RunClang["Process Runner\n(execute Clang binary)"]
+    RunGCC --> Oracle["Differential Oracle\n(coracle::run_differential_test)"]
+    RunClang --> Oracle
+    Oracle --> Verdict["Verdict\n(Match / Mismatch / CompileFailed / TimedOut)"]
 ```
 
-### Planned Architecture
+### Planned Extensions
 
-The target architecture will close the loop into an automated differential-testing fuzzing engine:
+The current pipeline handles a single seed end-to-end. Planned extensions will wrap this core into an automated, long-running differential fuzzing campaign:
 
 ```mermaid
 flowchart TD
-    subgraph CurrentGeneration["Implemented Generation Pipeline"]
-        SeedIn["Seed"] --> PRNG["Rng Engine"]
-        PRNG --> GenMod["Program Generator"]
-        GenMod --> ASTMod["AST"]
-        ASTMod --> PrintMod["AST Printer"]
-        PrintMod --> SourceCode["C Source File"]
+    subgraph Implemented["Implemented Pipeline (Single Seed)"]
+        Seed["Seed"] --> Core["Generate → Compile (GCC & Clang) → Run → Compare"]
+        Core --> Verdict{"Verdict"}
     end
 
-    subgraph PlannedDifferential["Planned Differential Engine"]
-        SourceCode --> CompA["Compiler Target A\n(e.g., GCC -O3)"]
-        SourceCode --> CompB["Compiler Target B\n(e.g., Clang -O3)"]
-        SourceCode --> CompBase["Baseline Compiler\n(e.g., GCC -O0)"]
-
-        CompA --> RunA["Process Runner\n(Child Subprocess)"]
-        CompB --> RunB["Process Runner\n(Child Subprocess)"]
-        CompBase --> RunBase["Process Runner\n(Child Subprocess)"]
-
-        RunA --> Oracle["Differential Oracle\n(Output & Exit Code Comparator)"]
-        RunB --> Oracle
-        RunBase --> Oracle
-
-        Oracle --> Decision{"Discrepancy\nDetected?"}
-        Decision -->|"No"| NextTest["Next Iteration"]
-        Decision -->|"Yes"| Classifier["Result Classifier\n(ICE / Miscompilation / Hang)"]
-        Classifier --> Reducer["Test-Case Reducer\n(Delta Debugging / AST Pruner)"]
-        Reducer --> Report["Reproducible Bug Report\n(Seed + Minimal C Program)"]
+    subgraph Planned["Planned Campaign & Triage"]
+        Campaign["Continuous Campaign Scheduler\n(loops over seeds)"] --> Seed
+        Verdict -->|"Match"| Campaign
+        Verdict -->|"Mismatch"| Reducer["Test-Case Reducer\n(Delta Debugging / AST Pruning)"]
+        Verdict -->|"CompileFailed / TimedOut"| TriageLog["Anomaly Logging"]
+        Reducer --> BugReport["Minimal Reproducible Bug Report\n(Seed + Minimized C Source)"]
     end
 ```
 
 ## Current Implementation
 
-The active codebase is organized into two primary modules: `src/generator/` and `src/executor/`.
+The active codebase is organized into four modules (`src/generator/`, `src/executor/`, `src/compiler/`, `src/oracle/`), tied together by an end-to-end CLI entrypoint in `src/main.cpp`.
 
 ### 1. Deterministic Random Number Generator (`src/generator/rng.hpp`)
 
@@ -170,6 +161,60 @@ Compiling and executing untrusted or randomly generated programs carries risks o
   * Records `exit_code` for normal exits (`WIFEXITED`).
   * Records signal terminations (`WIFSIGNALED`) as negative values (e.g., `-11` for `SIGSEGV`), allowing callers to distinguish between standard exits and abnormal crashes.
   * Sets `timed_out` boolean flag.
+
+### 6. Compiler Runner (`src/compiler/compiler_runner.hpp`, `compiler_runner.cpp`)
+
+The compiler runner provides `coracle::compile_source`, an abstraction over `run_process` that compiles a C source file into an executable binary using a selected compiler:
+* **Compiler Selection**: The `CompilerKind` enum (`GCC`, `Clang`) maps via `compiler_command` to the system binary name (`"gcc"`, `"clang"`), resolved through `PATH` by `execvp`.
+* **Minimal Baseline Invocation**: Currently invokes compilers without optimization flags (`<compiler> -o <output> <source>`), ensuring an identical, fair baseline across compilers. Any optimization flags (e.g., `-O2`, `-O3`) are intended as explicit experimental variables.
+* **Structured Result (`CompileResult`)**:
+  * `success`: `true` only if compilation succeeded and exited with code `0`.
+  * `timed_out`: `true` if the compiler exceeded `timeout_seconds`.
+  * `stderr_output`: Compiler diagnostics and warnings (captured even on successful compilations).
+  * `executable_path`: Path to the generated binary (valid only when `success == true`).
+* **Robust Rejection Handling**: Non-zero exit codes (syntax or semantic rejections) and negative exit codes (internal compiler crashes / ICE) both cleanly yield `success = false` rather than throwing exceptions.
+
+### 7. Differential Oracle (`src/oracle/differential_oracle.hpp`, `differential_oracle.cpp`)
+
+The differential oracle is the behavioral comparison engine. Given a C source string, `coracle::run_differential_test(source, compile_timeout, run_timeout)` performs a full differential test cycle:
+1. **Isolated Workspace**: Creates a unique throwaway directory via `mkdtemp("/tmp/coracle_test_XXXXXX")`. An RAII guard (`TempDir`) guarantees recursive removal via `nftw` upon return or exception.
+2. **Compilation**: Writes the source to `test.c` inside the temp directory, then compiles with GCC (`gcc_out`) and Clang (`clang_out`) via `compile_source`.
+3. **Execution**: If both compilations succeed, runs both executables under isolated subprocesses with execution timeouts via `run_process`.
+4. **Behavioral Comparison**: Compares stdout and exit codes between both executions.
+
+**Verdict Classification (`coracle::Verdict`)**:
+
+| Verdict | Meaning |
+| :--- | :--- |
+| `Match` | Both compilers produced executables that exited with identical exit codes and stdout output. |
+| `Mismatch` | Both compiled and ran, but produced differing stdout output or exit codes — indicating a potential compiler discrepancy. |
+| `GccCompileFailed` | GCC rejected the program with a non-zero exit code or crashed. |
+| `ClangCompileFailed` | Clang rejected the program with a non-zero exit code or crashed. |
+| `GccRunTimedOut` | GCC's compiled executable hung and was terminated by timeout. |
+| `ClangRunTimedOut` | Clang's compiled executable hung and was terminated by timeout. |
+
+> [!NOTE]
+> Compilation failures and runtime timeouts are separated into dedicated verdicts instead of being lumped into `Mismatch`. This distinction preserves experimental validity: a mismatch strictly denotes a behavioral disagreement between two valid binaries.
+
+**Structured Output (`DifferentialResult`)**:
+Captures the `Verdict`, along with `gcc_stdout`, `clang_stdout`, `gcc_exit_code`, `clang_exit_code`, `gcc_compile_stderr`, and `clang_compile_stderr` for downstream analysis and debugging.
+
+### 8. End-to-End CLI (`src/main.cpp`)
+
+The `coracle` executable provides the single-seed entrypoint connecting the complete pipeline:
+
+```bash
+coracle --seed <number>
+```
+
+Execution flow:
+1. Parses `--seed <number>` from command-line arguments.
+2. Initializes `coracle::Rng` with the given seed.
+3. Generates an AST via `generate_program(rng, config)`.
+4. Emits C source text via `print_program(program)`.
+5. Passes the source to `run_differential_test(source, 10, 5)`.
+6. Prints the generated program, the verdict, and detailed outputs on `Mismatch` or compiler failure.
+7. Exits with code `0` on `Match` / compile failures / timeouts, or `1` on `Mismatch`.
 
 ## Example
 
@@ -262,14 +307,23 @@ COracle/
 │   │   ├── process_runner.cpp         # POSIX fork/execvp/pipe implementation
 │   │   └── test_process_runner_manual.cpp # Manual test: Subprocess execution & timeouts
 │   │
-│   ├── compiler/                      # (Planned) Compiler wrapper abstraction
+│   ├── compiler/                      # Compiler toolchain invocation (GCC, Clang)
+│   │   ├── compiler_runner.hpp        # Compiler runner interface & CompileResult
+│   │   ├── compiler_runner.cpp        # Subprocess compilation via process_runner
+│   │   └── test_compiler_runner_manual.cpp # Manual test: GCC compilation on valid/invalid C
+│   │
 │   ├── coverage/                      # (Planned) Coverage feedback and instrumentation
-│   ├── oracle/                        # (Planned) Differential output comparison
+│   │
+│   ├── oracle/                        # Differential comparison and verdict determination
+│   │   ├── differential_oracle.hpp    # Oracle interface, Verdict enum, DifferentialResult
+│   │   ├── differential_oracle.cpp    # TempDir RAII, execution, output/exit code comparison
+│   │   └── test_oracle_manual.cpp     # Manual test: Match on valid C, GccCompileFailed on invalid
+│   │
 │   ├── reducer/                       # (Planned) Test-case reduction / delta debugging
 │   ├── reporting/                     # (Planned) Bug reproduction logging
 │   ├── scheduler/                     # (Planned) Fuzzing campaign loop
 │   ├── validator/                     # (Planned) Semantic validation & UB avoidance
-│   └── main.cpp                       # (Planned) Main entrypoint CLI
+│   └── main.cpp                       # End-to-end CLI driver (coracle --seed <number>)
 │
 ├── config/                            # Configuration files (e.g., config.toml)
 ├── corpus/                            # Test cases (crashes/, interesting/, seeds/)
@@ -288,7 +342,7 @@ COracle/
 
 * Linux-based operating system (the `process_runner` relies on POSIX APIs: `fork`, `execvp`, `pipe`, `waitpid`).
 * C++17 compliant compiler (`g++` or `clang++`).
-* A C compiler (e.g., `gcc`) for compiling generated test programs.
+* Both `gcc` and `clang` installed and available in `PATH` (invoked by the differential oracle).
 
 ### Compiling and Running Implemented Components
 
@@ -329,12 +383,33 @@ g++ -std=c++17 -Wall -Wextra src/executor/test_process_runner_manual.cpp src/exe
 ./test_process_runner
 ```
 
-#### 6. Compiling a Generated Program
-You can redirect the generator output to a C source file and compile it using GCC:
+#### 6. Test Compiler Runner
+Verifies compiler invocation on valid C code and error capture on invalid C code:
+```bash
+g++ -std=c++17 -Wall -Wextra src/compiler/test_compiler_runner_manual.cpp src/compiler/compiler_runner.cpp src/executor/process_runner.cpp -o test_compiler_runner
+./test_compiler_runner
+```
+
+#### 7. Test Differential Oracle
+Verifies full differential comparison on a well-defined program (expecting `Match`) and malformed C (expecting `GccCompileFailed`):
+```bash
+g++ -std=c++17 -Wall -Wextra src/oracle/test_oracle_manual.cpp src/oracle/differential_oracle.cpp src/compiler/compiler_runner.cpp src/executor/process_runner.cpp -o test_oracle
+./test_oracle
+```
+
+#### 8. Compiling a Generated Program Manually
+You can redirect the generator output to a C source file and compile it directly using GCC:
 ```bash
 ./test_generator > generated.c
 gcc -O2 generated.c -o generated_exe
 ./generated_exe
+```
+
+#### 9. Building and Running the End-to-End CLI
+Build the complete `coracle` binary and run a single-seed differential test:
+```bash
+g++ -std=c++17 -Wall -Wextra src/main.cpp src/generator/generator.cpp src/generator/ast_printer.cpp src/oracle/differential_oracle.cpp src/compiler/compiler_runner.cpp src/executor/process_runner.cpp -o coracle
+./coracle --seed 42
 ```
 
 ## Research Direction
@@ -352,17 +427,19 @@ The planned experimental methodology follows a 7-step differential testing workf
 
 ## Roadmap
 
-### Phase 1: Core Foundation *(Current)*
+### Phase 1: Core Foundation *(Complete)*
 - [x] Deterministic 64-bit RNG (`coracle::Rng`)
 - [x] Initial AST node hierarchy (expressions, declarations, assignments, prints)
 - [x] AST-to-C source printer (`coracle::print_program`)
 - [x] Seed-driven random AST generator with basic scoping rules
 - [x] Subprocess runner with timeout management and output limits (`coracle::run_process`)
 
-### Phase 2: Compiler Invocation & Differential Oracle *(Next)*
-- [ ] Compiler invocation abstraction (`src/compiler/`) to wrap `gcc` and `clang`
-- [ ] Differential comparison oracle (`src/oracle/`) comparing outputs across optimization tiers
-- [ ] Crash and Internal Compiler Error (ICE) classification
+### Phase 2: Compiler Invocation & Differential Oracle *(Current)*
+- [x] Compiler invocation abstraction (`src/compiler/`) to wrap `gcc` and `clang`
+- [x] Differential comparison oracle (`src/oracle/`) comparing outputs across GCC and Clang
+- [x] Structured verdict classification (`coracle::Verdict` for Match, Mismatch, CompileFailed, TimedOut)
+- [x] End-to-end CLI driver for single-seed differential testing (`src/main.cpp`)
+- [ ] Optimization flag tiers (e.g., `-O0` vs `-O3`)
 - [ ] CMake build system configuration for building targets and unit tests
 
 ### Phase 3: Language Expansion & Validation *(Planned)*
@@ -388,4 +465,3 @@ The design of COracle adheres to several key engineering principles:
 ## Research Context
 
 COracle is being developed as a student research project investigating automated compiler testing and differential analysis techniques. It is designed to explore how constrained program synthesis and differential oracles can effectively detect subtle miscompilation bugs and crashes in modern production compilers.
-
